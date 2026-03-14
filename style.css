@@ -1,0 +1,293 @@
+/* ─── Reset & base ────────────────────────────────────────────────────────── */
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: #0a0a0f;
+    color: #fff;
+    font-family: monospace;
+    overflow: hidden;
+}
+
+button {
+    font-family: monospace;
+    font-size: 12px;
+    background: rgba(255,255,255,0.05);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 3px;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+}
+
+button:hover {
+    background: rgba(255,255,255,0.1);
+    border-color: rgba(255,255,255,0.3);
+}
+
+button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+/* ─── Layout ──────────────────────────────────────────────────────────────── */
+
+#app {
+    display: flex;
+    flex-direction: row;
+    height: 100vh;
+    align-items: center;
+    gap: 16px;
+    padding: 16px;
+    user-select: none;
+}
+
+#main {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    gap: 12px;
+}
+
+/* ─── Palette ─────────────────────────────────────────────────────────────── */
+
+#clip-column-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+#clip-column-title {
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: rgba(0, 255, 208, 0.5);
+    text-align: center;
+}
+
+#clip-column {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 80px;
+    overflow-y: auto;
+}
+
+.palette-slot {
+    width: 80px;
+    height: 60px;
+    border: 1px dashed rgba(0, 255, 208, 0.15);
+    border-radius: 2px;
+}
+
+.palette-clip {
+    position: relative;
+    width: 80px;
+    height: 60px;
+    overflow: hidden;
+}
+
+.palette-clip__canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.palette-clip__delete {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    line-height: 1;
+    font-size: 12px;
+    background: rgba(0, 0, 0, 0.7);
+    color: #ff4466;
+    border: 1px solid #ff4466;
+    border-radius: 3px;
+    cursor: pointer;
+    z-index: 10;
+    display: none;
+}
+
+.palette-clip__delete:hover {
+    background: rgba(255, 68, 102, 0.2);
+}
+
+/* ─── Controls ────────────────────────────────────────────────────────────── */
+
+#controls {
+    display: flex;
+    gap: 8px;
+}
+
+#timeline-controls {
+    display: flex;
+    gap: 8px;
+}
+
+/* ─── Waveform canvas ─────────────────────────────────────────────────────── */
+
+#canvas-container {
+    width: 100%;
+}
+
+#waveform-canvas {
+    display: block;
+    cursor: crosshair;
+}
+
+/* ─── Timeline ────────────────────────────────────────────────────────────── */
+
+#timeline-container {
+    position: relative;
+    width: 100%;
+    height: 60px;
+}
+
+#timeline {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: #111118;
+}
+
+#timeline-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+/* ─── Timeline clip ───────────────────────────────────────────────────────── */
+
+.timeline-clip {
+    position: absolute;
+    height: 60px;
+    overflow: visible;
+    cursor: grab;
+}
+
+.timeline-clip__canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+/* Shift-mode: show copy cursor on all clips */
+#timeline.shift-mode .timeline-clip {
+    cursor: copy !important;
+}
+
+/* ─── Timeline placeholder ────────────────────────────────────────────────── */
+
+.timeline-placeholder {
+    position: absolute;
+    height: 60px;
+    background: rgba(0, 255, 208, 0.2);
+    border: 1px solid #00ffd0;
+    display: none;
+    pointer-events: none;
+}
+
+/* ─── Clip handles ────────────────────────────────────────────────────────── */
+
+.clip-handle {
+    position: absolute;
+    top: 0;
+    width: 4px;
+    height: 100%;
+    z-index: 10;
+    overflow: hidden;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.clip-handle--left {
+    left: 0;
+    border-radius: 3px 0 0 3px;
+}
+
+.clip-handle--right {
+    right: 0;
+    border-radius: 0 3px 3px 0;
+}
+
+/* Top half = trim (teal) */
+.clip-handle__trim {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 50%;
+    background: rgba(0, 255, 208, 0.85);
+}
+
+.clip-handle--left .clip-handle__trim {
+    cursor: w-resize;
+}
+
+.clip-handle--right .clip-handle__trim {
+    cursor: e-resize;
+}
+
+/* Bottom half = stretch (amber) */
+.clip-handle__stretch {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 50%;
+    background: rgba(255, 180, 0, 0.75);
+    cursor: ew-resize;
+}
+
+/* ─── Drag ghost ──────────────────────────────────────────────────────────── */
+
+.drag-ghost {
+    position: fixed;
+    pointer-events: none;
+    opacity: 0.8;
+}
+
+/* ─── Drag label ──────────────────────────────────────────────────────────── */
+
+.drag-label {
+    position: absolute;
+    top: -22px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.85);
+    font-size: 11px;
+    font-family: monospace;
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 20;
+    border: 1px solid;
+}
+
+.drag-label[data-color="teal"] {
+    color: #00ffd0;
+    border-color: rgba(0, 255, 208, 0.3);
+}
+
+.drag-label[data-color="amber"] {
+    color: #ffb400;
+    border-color: rgba(255, 180, 0, 0.3);
+}
