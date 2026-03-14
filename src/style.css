@@ -29,7 +29,9 @@ button:disabled {
 
 #main {
   display: flex;
+  flex: 1;
   flex-direction: column;
+  min-width: 0;
 }
 
 #timeline-container {
@@ -55,4 +57,29 @@ button:disabled {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+#clip-column-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#clip-column-title {
+  font-family: monospace;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: rgba(0, 255, 208, 0.5);
+  text-align: center;
+}
+
+body {
+  background: #0a0a0f;
+  margin: 0;
+  color: #fff;
+}
+
+#timeline.shift-mode .timeline-clip {
+  cursor: copy !important;
 }

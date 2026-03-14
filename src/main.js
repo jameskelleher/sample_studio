@@ -1,97 +1,145 @@
 import './style.css';
-import p5 from 'p5';
-import * as Tone from 'tone';
 import { SoundTouchNode } from '@soundtouchjs/audio-worklet';
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const TIMELINE_DURATION = 10;
 const PX_PER_SEC = window.innerWidth / TIMELINE_DURATION;
 const SNAP_DISTANCE = 40;
-const HANDLE_WIDTH = 6;
+const CLIP_HANDLE_WIDTH = 4;
+const SELECTION_HANDLE_GRAB = 8;
+const PALETTE_SLOTS = 6;
 
-// ─── Audio setup ─────────────────────────────────────────────────────────────
+// ─── Audio context ────────────────────────────────────────────────────────────
 
-const buffer = await Tone.ToneAudioBuffer.fromUrl('amen.flac');
-const samples = buffer.toArray(0); // full source samples, never mutated
-const player = new Tone.Player(buffer).toDestination();
-
-let audioCtx = null;
+const audioCtx = new AudioContext();
 let soundTouchRegistered = false;
-const activeSources = [];
 
-async function getAudioContext() {
-    if (!audioCtx) audioCtx = new AudioContext();
+async function ensureReady() {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
     if (!soundTouchRegistered) {
         await SoundTouchNode.register(audioCtx, '/soundtouch-processor.js');
         soundTouchRegistered = true;
     }
-    return audioCtx;
 }
 
-function stopAllStretched() {
-    for (const src of activeSources) {
-        try { src.stop(); } catch (_) { }
-    }
-    activeSources.length = 0;
-}
+// ─── Load source audio ────────────────────────────────────────────────────────
 
-async function playStretchedClip(clip, stretchRatio) {
-    const ctx = await getAudioContext();
-    if (ctx.state === 'suspended') await ctx.resume();
+const sourceBuffer = await fetch('amen.flac')
+    .then(r => r.arrayBuffer())
+    .then(ab => audioCtx.decodeAudioData(ab));
 
-    const nativeBuffer = ctx.createBuffer(1, clip.samples.length, buffer.sampleRate);
-    nativeBuffer.copyToChannel(
-        clip.samples instanceof Float32Array ? clip.samples : Float32Array.from(clip.samples),
-        0
-    );
+const samples = sourceBuffer.getChannelData(0); // Float32Array, never mutated
 
-    const stNode = new SoundTouchNode(ctx);
-    stNode.connect(ctx.destination);
-    stNode.playbackRate.value = 1 / stretchRatio;
-    stNode.pitch.value = 1;
-
-    const src = ctx.createBufferSource();
-    src.buffer = nativeBuffer;
-    src.playbackRate.value = 1 / stretchRatio;
-    src.connect(stNode);
-    src.start();
-
-    activeSources.push(src);
-    src.onended = () => {
-        const i = activeSources.indexOf(src);
-        if (i !== -1) activeSources.splice(i, 1);
-    };
-}
-
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 
 const timeline = [];
-// placed = { clip, startTime, stretchRatio }
+// placed = { clip, startTime, stretchRatio, reversed }
 // clip   = { startTime, duration, samples }
-// clip.startTime/duration refer to position within the *source* buffer
-// samples is always a slice of the source — trimming creates a new slice
 
 const clips = [];
 const selection = { startTime: null, endTime: null };
-let mainPlayheadStart = null;
-let isDragging = false;
 
-// ─── DOM refs ────────────────────────────────────────────────────────────────
+let mainPlayNode = null;
+let mainPlayStart = null;
+let mainPlayOffset = null;
+let transportStart = null;
+const activeSources = [];
 
-const timelineEl = document.getElementById('timeline');
-const timelineCanvas = document.getElementById('timeline-canvas');
-timelineCanvas.width = timelineCanvas.offsetWidth;
-timelineCanvas.height = timelineCanvas.offsetHeight;
-const timelineCtx = timelineCanvas.getContext('2d');
-const placeholder = makePlaceholder();
+let shiftDown = false;
+let clipDragging = false;
 
-// ─── DOM events ──────────────────────────────────────────────────────────────
+// ─── Playback helpers ─────────────────────────────────────────────────────────
 
-document.addEventListener('click', async () => {
-    await Tone.start();
-    await getAudioContext();
-}, { once: true });
+function makeBufferSource(clipSamples) {
+    const buf = audioCtx.createBuffer(1, clipSamples.length, sourceBuffer.sampleRate);
+    buf.copyToChannel(
+        clipSamples instanceof Float32Array ? clipSamples : Float32Array.from(clipSamples), 0
+    );
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    return src;
+}
+
+async function playStretched(clip, stretchRatio, when = 0) {
+    await ensureReady();
+    const src = makeBufferSource(clip.samples);
+    const stNode = new SoundTouchNode(audioCtx);
+    stNode.connect(audioCtx.destination);
+    stNode.playbackRate.value = 1 / stretchRatio;
+    stNode.pitch.value = 1;
+    src.playbackRate.value = 1 / stretchRatio;
+    src.connect(stNode);
+    src.start(when);
+    activeSources.push(src);
+    src.onended = () => activeSources.splice(activeSources.indexOf(src), 1);
+}
+
+function playDirect(clip, when = 0) {
+    const src = makeBufferSource(clip.samples);
+    src.connect(audioCtx.destination);
+    src.start(when);
+    activeSources.push(src);
+    src.onended = () => activeSources.splice(activeSources.indexOf(src), 1);
+    return src;
+}
+
+function stopAll() {
+    for (const src of [...activeSources]) {
+        try { src.stop(); } catch (_) { }
+    }
+    activeSources.length = 0;
+    mainPlayNode = null;
+}
+
+async function playMain(startAt = 0, duration = null) {
+    await ensureReady();
+    stopAll();
+
+    const src = audioCtx.createBufferSource();
+    src.buffer = sourceBuffer;
+    src.connect(audioCtx.destination);
+
+    const offset = Math.max(0, Math.min(startAt, sourceBuffer.duration));
+    duration !== null
+        ? src.start(0, offset, duration)
+        : src.start(0, offset);
+
+    mainPlayNode = src;
+    mainPlayStart = audioCtx.currentTime;
+    mainPlayOffset = offset;
+
+    activeSources.push(src);
+    src.onended = () => {
+        activeSources.splice(activeSources.indexOf(src), 1);
+        if (mainPlayNode === src) mainPlayNode = null;
+    };
+}
+
+// ─── Timeline transport ───────────────────────────────────────────────────────
+
+async function startTimeline() {
+    await ensureReady();
+    stopAll();
+    transportStart = audioCtx.currentTime;
+
+    for (const placed of timeline) {
+        const when = transportStart + placed.startTime;
+        const ratio = placed.stretchRatio ?? 1;
+        Math.abs(ratio - 1) < 0.01
+            ? playDirect(placed.clip, when)
+            : playStretched(placed.clip, ratio, when);
+    }
+}
+
+function stopTimeline() {
+    stopAll();
+    transportStart = null;
+}
+
+// ─── DOM events ───────────────────────────────────────────────────────────────
+
+document.addEventListener('click', () => ensureReady(), { once: true });
 
 document.addEventListener('click', (e) => {
     if (!e.target.closest('#canvas-container') && !e.target.closest('#preview-btn')) {
@@ -100,60 +148,16 @@ document.addEventListener('click', (e) => {
     }
 });
 
-document.getElementById('play-btn').onclick = () => playSelection();
-document.getElementById('stop-btn').onclick = () => player.stop();
+document.getElementById('timeline-play-btn').onclick = () => startTimeline();
+document.getElementById('timeline-stop-btn').onclick = () => stopTimeline();
 
 document.getElementById('preview-btn').onclick = () => {
     const start = Math.min(selection.startTime, selection.endTime);
     const end = Math.max(selection.startTime, selection.endTime);
-    playSelection(start, end - start);
+    playMain(start, end - start);
 };
 
-document.getElementById('save-btn').onclick = () => saveClip();
-
-document.getElementById('timeline-play-btn').onclick = async () => {
-    Tone.Transport.stop();
-    Tone.Transport.cancel();
-    stopAllStretched();
-    player.stop();
-    await getAudioContext();
-
-    for (const placed of timeline) {
-        const ratio = placed.stretchRatio ?? 1;
-        if (Math.abs(ratio - 1) < 0.01) {
-            Tone.Transport.schedule((time) => {
-                player.start(time, placed.clip.startTime, placed.clip.duration);
-            }, placed.startTime);
-        } else {
-            Tone.Transport.schedule(() => {
-                playStretchedClip(placed.clip, ratio);
-            }, placed.startTime);
-        }
-    }
-
-    Tone.Transport.start();
-};
-
-document.getElementById('timeline-stop-btn').onclick = () => {
-    Tone.Transport.stop();
-    player.stop();
-    stopAllStretched();
-};
-
-document.getElementById('timeline-clear-btn').onclick = () => {
-    Tone.Transport.stop();
-    Tone.Transport.cancel();
-    player.stop();
-    stopAllStretched();
-    timeline.length = 0;
-    timelineEl.innerHTML = '';
-    timelineEl.appendChild(placeholder);
-    placeholder.style.display = 'none';
-};
-
-// ─── Audio helpers ────────────────────────────────────────────────────────────
-
-function saveClip() {
+document.getElementById('save-btn').onclick = () => {
     const start = Math.min(selection.startTime, selection.endTime);
     const end = Math.max(selection.startTime, selection.endTime);
     const clip = makeClipFromSource(start, end - start);
@@ -161,41 +165,299 @@ function saveClip() {
     renderPaletteClip(clip);
     selection.startTime = null;
     selection.endTime = null;
+};
+
+document.getElementById('timeline-clear-btn').onclick = () => {
+    stopTimeline();
+    timeline.length = 0;
+    timelineEl.innerHTML = '';
+    timelineEl.appendChild(placeholder);
+    placeholder.style.display = 'none';
+};
+
+// Palette slots
+const clipColumn = document.getElementById('clip-column');
+for (let i = 0; i < PALETTE_SLOTS; i++) {
+    const slot = document.createElement('div');
+    slot.style.cssText = 'width:80px;height:60px;border:1px dashed rgba(0,255,208,0.15);border-radius:2px;box-sizing:border-box;';
+    slot.classList.add('palette-slot');
+    clipColumn.appendChild(slot);
 }
+
+// Shift key tracking (for duplicate drag)
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Shift') {
+        shiftDown = true;
+        timelineEl.classList.add('shift-mode');
+    }
+    // R key = reverse hovered clip
+    if (e.key === 'r' || e.key === 'R') {
+        const hovered = timelineEl.querySelector('.timeline-clip[data-hovered]');
+        if (!hovered) return;
+        const placed = timeline.find(p => p._container === hovered);
+        if (!placed) return;
+        placed.reversed = !placed.reversed;
+        placed.clip = { ...placed.clip, samples: placed.clip.samples.slice().reverse() };
+        const canvas = hovered.querySelector('canvas');
+        canvas.width = canvas.width;
+        drawClipCanvas(canvas, placed.clip);
+    }
+});
+
+document.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift') {
+        shiftDown = false;
+        if (!clipDragging) {
+            timelineEl.classList.remove('shift-mode');
+            // Force cursor refresh
+            timelineEl.style.pointerEvents = 'none';
+            requestAnimationFrame(() => timelineEl.style.pointerEvents = '');
+        }
+    }
+});
+
+window.addEventListener('blur', () => {
+    shiftDown = false;
+    clipDragging = false;
+    timelineEl.classList.remove('shift-mode');
+});
+
+// ─── Clip helpers ─────────────────────────────────────────────────────────────
 
 function makeClipFromSource(startTime, duration) {
-    const startSample = Math.floor(startTime * buffer.sampleRate);
-    const endSample = Math.floor((startTime + duration) * buffer.sampleRate);
-    return { startTime, duration, samples: samples.slice(startSample, endSample) };
+    const s = Math.floor(startTime * sourceBuffer.sampleRate);
+    const e = Math.floor((startTime + duration) * sourceBuffer.sampleRate);
+    return { startTime, duration, samples: samples.slice(s, e) };
 }
 
-function playSelection(startAt = null, duration = null) {
-    player.stop();
-    if (startAt === null) {
-        mainPlayheadStart = Tone.now();
-        player.start();
-        return;
+// ─── DOM refs ─────────────────────────────────────────────────────────────────
+
+const timelineEl = document.getElementById('timeline');
+const timelineCanvas = document.getElementById('timeline-canvas');
+timelineCanvas.width = timelineCanvas.offsetWidth;
+timelineCanvas.height = timelineCanvas.offsetHeight;
+const timelineCtx = timelineCanvas.getContext('2d');
+const placeholder = makePlaceholder();
+
+// ─── Waveform canvas ──────────────────────────────────────────────────────────
+
+const waveformCanvas = document.createElement('canvas');
+waveformCanvas.width = document.getElementById('canvas-container').offsetWidth;
+waveformCanvas.height = 300;
+waveformCanvas.style.cssText = 'display:block;cursor:crosshair;';
+document.getElementById('canvas-container').appendChild(waveformCanvas);
+const wCtx = waveformCanvas.getContext('2d');
+
+// Pre-render static waveform into an offscreen cache
+const waveformCache = document.createElement('canvas');
+waveformCache.width = waveformCanvas.width;
+waveformCache.height = waveformCanvas.height;
+(function buildCache() {
+    const ctx = waveformCache.getContext('2d');
+    const w = waveformCache.width;
+    const h = waveformCache.height;
+    const spp = samples.length / w;
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = '#00ffd0';
+    ctx.lineWidth = 1;
+    for (let px = 0; px < w; px++) {
+        const s = Math.floor(px * spp);
+        const e = Math.floor((px + 1) * spp);
+        let min = 1, max = -1;
+        for (let i = s; i < e; i++) {
+            if (samples[i] < min) min = samples[i];
+            if (samples[i] > max) max = samples[i];
+        }
+        const yMin = ((min * -1 + 1) / 2) * h * 0.8 + h * 0.1;
+        const yMax = ((max * -1 + 1) / 2) * h * 0.8 + h * 0.1;
+        ctx.beginPath();
+        ctx.moveTo(px, yMax);
+        ctx.lineTo(px, yMin);
+        ctx.stroke();
     }
-    mainPlayheadStart = Tone.now() - startAt;
-    if (duration === null) {
-        player.start(Tone.now(), startAt);
-    } else {
-        player.start(Tone.now(), startAt, duration);
+})();
+
+// ─── Waveform draw loop ───────────────────────────────────────────────────────
+
+let waveformMouseX = -1;
+
+function drawFrame() {
+    const w = waveformCanvas.width;
+    const h = waveformCanvas.height;
+
+    wCtx.drawImage(waveformCache, 0, 0);
+
+    // Selection
+    if (selection.startTime !== null && selection.startTime !== selection.endTime) {
+        const left = Math.min(selection.startTime, selection.endTime);
+        const right = Math.max(selection.startTime, selection.endTime);
+        const x1 = srcTimeToX(left);
+        const x2 = srcTimeToX(right);
+
+        wCtx.fillStyle = 'rgba(0,255,208,0.15)';
+        wCtx.fillRect(x1, 0, x2 - x1, h);
+
+        wCtx.fillStyle = 'rgba(0,255,208,0.85)';
+        wCtx.fillRect(x1 - 1, 0, 2, h);
+        wCtx.fillRect(x2 - 1, 0, 2, h);
+
+        // Grip nubs
+        const nubs = 3, spacing = 8;
+        const top = h / 2 - ((nubs - 1) * spacing) / 2;
+        wCtx.fillStyle = '#0a0a0f';
+        for (let i = 0; i < nubs; i++) {
+            const y = top + i * spacing;
+            wCtx.beginPath(); wCtx.arc(x1, y, 2, 0, Math.PI * 2); wCtx.fill();
+            wCtx.beginPath(); wCtx.arc(x2, y, 2, 0, Math.PI * 2); wCtx.fill();
+        }
     }
+
+    // Mouse cursor
+    if (waveformMouseX >= 0 && waveformMouseX <= w) {
+        wCtx.strokeStyle = 'rgba(255,255,255,0.3)';
+        wCtx.lineWidth = 1;
+        wCtx.beginPath();
+        wCtx.moveTo(waveformMouseX, 0);
+        wCtx.lineTo(waveformMouseX, h);
+        wCtx.stroke();
+    }
+
+    // Main playhead
+    if (mainPlayNode !== null) {
+        const elapsed = audioCtx.currentTime - mainPlayStart;
+        const x = srcTimeToX(mainPlayOffset + elapsed);
+        wCtx.strokeStyle = 'rgba(255,255,255,0.7)';
+        wCtx.lineWidth = 1;
+        wCtx.beginPath();
+        wCtx.moveTo(x, 0);
+        wCtx.lineTo(x, h);
+        wCtx.stroke();
+    }
+
+    // Timeline playhead
+    timelineCtx.clearRect(0, 0, timelineCanvas.width, timelineCanvas.height);
+    if (transportStart !== null) {
+        const elapsed = audioCtx.currentTime - transportStart;
+        if (elapsed <= TIMELINE_DURATION) {
+            const x = elapsed * PX_PER_SEC;
+            timelineCtx.strokeStyle = 'rgba(255,255,255,0.7)';
+            timelineCtx.lineWidth = 1;
+            timelineCtx.beginPath();
+            timelineCtx.moveTo(x, 0);
+            timelineCtx.lineTo(x, timelineCanvas.height);
+            timelineCtx.stroke();
+        } else {
+            transportStart = null;
+        }
+    }
+
+    // Button state
+    const noSel = selection.startTime === null || selection.startTime === selection.endTime;
+    document.getElementById('save-btn').disabled = noSel;
+    document.getElementById('preview-btn').disabled = noSel;
+
+    requestAnimationFrame(drawFrame);
 }
 
-// ─── Waveform drawing ─────────────────────────────────────────────────────────
+requestAnimationFrame(drawFrame);
 
-/**
- * Draw clip waveform onto a canvas.
- * sampleOffset lets us pan the view into the samples array (for trim-scrolling).
- */
+// ─── Waveform interaction ─────────────────────────────────────────────────────
+
+let selDragMode = null;
+
+waveformCanvas.addEventListener('mousemove', (e) => {
+    const x = canvasX(e);
+    waveformMouseX = x;
+
+    if (selection.startTime !== null && selection.startTime !== selection.endTime) {
+        const left = Math.min(selection.startTime, selection.endTime);
+        const right = Math.max(selection.startTime, selection.endTime);
+        if (Math.abs(x - srcTimeToX(left)) < SELECTION_HANDLE_GRAB ||
+            Math.abs(x - srcTimeToX(right)) < SELECTION_HANDLE_GRAB) {
+            waveformCanvas.style.cursor = 'ew-resize';
+            return;
+        }
+    }
+    waveformCanvas.style.cursor = 'crosshair';
+});
+
+waveformCanvas.addEventListener('mouseleave', () => { waveformMouseX = -1; });
+
+waveformCanvas.addEventListener('mousedown', (e) => {
+    const x = canvasX(e);
+    const time = xToSrcTime(x);
+
+    if (selection.startTime !== null && selection.startTime !== selection.endTime) {
+        const left = Math.min(selection.startTime, selection.endTime);
+        const right = Math.max(selection.startTime, selection.endTime);
+
+        if (Math.abs(x - srcTimeToX(left)) < SELECTION_HANDLE_GRAB) {
+            selDragMode = 'start';
+            selection.startTime = left;
+            selection.endTime = right;
+            return;
+        }
+        if (Math.abs(x - srcTimeToX(right)) < SELECTION_HANDLE_GRAB) {
+            selDragMode = 'end';
+            selection.startTime = left;
+            selection.endTime = right;
+            return;
+        }
+    }
+
+    selDragMode = 'new';
+    selection.startTime = time;
+    selection.endTime = time;
+});
+
+document.addEventListener('mousemove', (e) => {
+    if (!selDragMode) return;
+    const rect = waveformCanvas.getBoundingClientRect();
+    const x = Math.max(0, Math.min(e.clientX - rect.left, waveformCanvas.width));
+    const time = xToSrcTime(x);
+
+    if (selDragMode === 'new') selection.endTime = time;
+    if (selDragMode === 'start') selection.startTime = time;
+    if (selDragMode === 'end') selection.endTime = time;
+});
+
+document.addEventListener('mouseup', () => {
+    const mode = selDragMode;
+    selDragMode = null;
+    if (mode === 'new' && selection.startTime === selection.endTime) {
+        if (mainPlayNode !== null) {
+            stopAll();
+        } else {
+            playMain(selection.startTime);
+        }
+        selection.startTime = null;
+        selection.endTime = null;
+    }
+});
+
+// ─── Coordinate helpers ───────────────────────────────────────────────────────
+
+function srcTimeToX(time) {
+    return (time / sourceBuffer.duration) * waveformCanvas.width;
+}
+
+function xToSrcTime(x) {
+    return (x / waveformCanvas.width) * sourceBuffer.duration;
+}
+
+function canvasX(e) {
+    return e.clientX - waveformCanvas.getBoundingClientRect().left;
+}
+
+// ─── Clip canvas drawing ──────────────────────────────────────────────────────
+
 function drawClipCanvas(canvas, clip, sampleOffset = 0, visibleSampleCount = null) {
     const ctx = canvas.getContext('2d');
     const w = canvas.width;
     const h = canvas.height;
-    const visibleSamples = visibleSampleCount ?? (clip.samples.length - sampleOffset);
-    const samplesPerPixel = visibleSamples / w;
+    const visible = visibleSampleCount ?? (clip.samples.length - sampleOffset);
+    const spp = visible / w;
 
     ctx.fillStyle = '#0a0a0f';
     ctx.fillRect(0, 0, w, h);
@@ -203,18 +465,15 @@ function drawClipCanvas(canvas, clip, sampleOffset = 0, visibleSampleCount = nul
     ctx.lineWidth = 1;
 
     for (let px = 0; px < w; px++) {
-        const start = sampleOffset + Math.floor(px * samplesPerPixel);
-        const end = sampleOffset + Math.floor((px + 1) * samplesPerPixel);
-
+        const s = sampleOffset + Math.floor(px * spp);
+        const e = sampleOffset + Math.floor((px + 1) * spp);
         let min = 1, max = -1;
-        for (let i = start; i < end; i++) {
+        for (let i = s; i < e; i++) {
             if (clip.samples[i] < min) min = clip.samples[i];
             if (clip.samples[i] > max) max = clip.samples[i];
         }
-
         const yMin = ((min * -1 + 1) / 2) * h;
         const yMax = ((max * -1 + 1) / 2) * h;
-
         ctx.beginPath();
         ctx.moveTo(px, yMax);
         ctx.lineTo(px, yMin);
@@ -226,7 +485,7 @@ function drawClipCanvas(canvas, clip, sampleOffset = 0, visibleSampleCount = nul
 
 function renderPaletteClip(clip) {
     const wrapper = document.createElement('div');
-    wrapper.style.cssText = 'position: relative; width: 80px; height: 60px; overflow: hidden;';
+    wrapper.style.cssText = 'position:relative;width:80px;height:60px;overflow:hidden;';
 
     const canvas = document.createElement('canvas');
     canvas.width = 80;
@@ -236,16 +495,20 @@ function renderPaletteClip(clip) {
     const deleteBtn = document.createElement('button');
     deleteBtn.textContent = '×';
     deleteBtn.style.cssText = `
-        position: absolute; top: 2px; left: 2px;
-        width: 16px; height: 16px; padding: 0;
-        line-height: 1; font-size: 12px;
-        background: rgba(0,0,0,0.7); color: #ff4466;
-        border: 1px solid #ff4466; border-radius: 3px;
-        cursor: pointer; z-index: 10; display: none;
+        position:absolute;top:2px;left:2px;width:16px;height:16px;
+        padding:0;line-height:1;font-size:12px;background:rgba(0,0,0,0.7);
+        color:#ff4466;border:1px solid #ff4466;border-radius:3px;
+        cursor:pointer;z-index:10;display:none;
     `;
 
-    wrapper.addEventListener('mouseenter', () => deleteBtn.style.display = 'block');
-    wrapper.addEventListener('mouseleave', () => deleteBtn.style.display = 'none');
+    wrapper.addEventListener('mouseenter', () => {
+        deleteBtn.style.display = 'block';
+        canvas.style.cursor = 'grab';
+    });
+    wrapper.addEventListener('mouseleave', () => {
+        deleteBtn.style.display = 'none';
+        canvas.style.cursor = '';
+    });
 
     deleteBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -257,38 +520,32 @@ function renderPaletteClip(clip) {
     canvas.addEventListener('mousedown', (e) => {
         dragged = false;
         document.addEventListener('mousemove', () => { dragged = true; }, { once: true });
-
         const ghostWidth = clip.duration * PX_PER_SEC;
         const dragOffset = (e.offsetX / canvas.width) * ghostWidth;
-
         startClipDrag(e, clip, ghostWidth, dragOffset, (snappedTime) => {
             if (snappedTime !== null) {
-                const placed = { clip, startTime: snappedTime, stretchRatio: 1 };
+                const placed = { clip, startTime: snappedTime, stretchRatio: 1, reversed: false };
                 timeline.push(placed);
                 renderTimelineClip(placed);
             }
         });
     });
 
-    canvas.onclick = () => {
-        if (!dragged) playSelection(clip.startTime, clip.duration);
-    };
+    canvas.onclick = () => { if (!dragged) playMain(clip.startTime, clip.duration); };
 
     wrapper.appendChild(canvas);
     wrapper.appendChild(deleteBtn);
-    document.getElementById('clip-column').appendChild(wrapper);
+    const column = document.getElementById('clip-column');
+    const firstSlot = column.querySelector('.palette-slot');
+    firstSlot ? column.insertBefore(wrapper, firstSlot) : column.appendChild(wrapper);
+    document.querySelector('#clip-column .palette-slot:last-child')?.remove();
 }
 
-// ─── Timeline clip drag (move) ────────────────────────────────────────────────
+// ─── Clip drag ────────────────────────────────────────────────────────────────
 
-/**
- * @param {MouseEvent} e
- * @param {object} clip
- * @param {number} ghostWidth - pixel width of the ghost (may differ from clip.duration * PX_PER_SEC if stretched)
- * @param {number} dragOffset - px from clip left edge to cursor
- * @param {function} onDrop
- */
 function startClipDrag(e, clip, ghostWidth, dragOffset, onDrop) {
+    clipDragging = true;
+
     const ghost = document.createElement('canvas');
     ghost.width = ghostWidth;
     ghost.height = 60;
@@ -300,12 +557,10 @@ function startClipDrag(e, clip, ghostWidth, dragOffset, onDrop) {
     function onMouseMove(e) {
         ghost.style.left = e.clientX - dragOffset + 'px';
         ghost.style.top = e.clientY - 30 + 'px';
-
         const rect = timelineEl.getBoundingClientRect();
         if (e.clientY > rect.top - SNAP_DISTANCE) {
             const rawTime = (e.clientX - dragOffset - rect.left) / PX_PER_SEC;
-            const displayDuration = ghostWidth / PX_PER_SEC;
-            const snapped = snapToFreePosition(rawTime, displayDuration);
+            const snapped = snapToFreePosition(rawTime, ghostWidth / PX_PER_SEC);
             placeholder.style.display = 'block';
             placeholder.style.left = snapped * PX_PER_SEC + 'px';
             placeholder.style.width = ghostWidth + 'px';
@@ -315,10 +570,12 @@ function startClipDrag(e, clip, ghostWidth, dragOffset, onDrop) {
     }
 
     function onMouseUp() {
+        clipDragging = false;
         document.removeEventListener('mousemove', onMouseMove);
         document.removeEventListener('mouseup', onMouseUp);
         ghost.remove();
-
+        // Clean up shift-mode if shift was released during drag
+        if (!shiftDown) timelineEl.classList.remove('shift-mode');
         if (placeholder.style.display !== 'none') {
             const snappedTime = parseFloat(placeholder.style.left) / PX_PER_SEC;
             placeholder.style.display = 'none';
@@ -332,20 +589,18 @@ function startClipDrag(e, clip, ghostWidth, dragOffset, onDrop) {
     document.addEventListener('mouseup', onMouseUp);
 }
 
-// ─── Timeline clip rendering ──────────────────────────────────────────────────
+// ─── Timeline clip ────────────────────────────────────────────────────────────
 
 function renderTimelineClip(placed) {
     const stretchedWidth = Math.round(placed.clip.duration * (placed.stretchRatio ?? 1) * PX_PER_SEC);
 
     const container = document.createElement('div');
+    container.classList.add('timeline-clip');
     container.style.cssText = `
-        position: absolute;
-        left: ${placed.startTime * PX_PER_SEC}px;
-        width: ${stretchedWidth}px;
-        height: 60px;
-        overflow: visible;
-        cursor: grab;
-        box-sizing: border-box;
+        position:absolute;
+        left:${placed.startTime * PX_PER_SEC}px;
+        width:${stretchedWidth}px;
+        height:60px;overflow:visible;cursor:grab;box-sizing:border-box;
     `;
 
     const canvas = document.createElement('canvas');
@@ -362,89 +617,105 @@ function renderTimelineClip(placed) {
 
     timelineEl.appendChild(container);
 
+    // Store container ref on placed for R-key reverse lookup
+    placed._container = container;
+
     let handleDragActive = false;
 
-    // Show/hide handles on hover
     container.addEventListener('mouseenter', () => {
         leftHandle.style.opacity = '1';
         rightHandle.style.opacity = '1';
+        container.dataset.hovered = 'true';
     });
     container.addEventListener('mouseleave', () => {
+        delete container.dataset.hovered;
         if (handleDragActive) return;
         leftHandle.style.opacity = '0';
         rightHandle.style.opacity = '0';
     });
 
-    // ── Move drag ────────────────────────────────────────────────────────────
+    // ── Move / duplicate ──────────────────────────────────────────────────────
     container.addEventListener('mousedown', (e) => {
-        // Only fire from the container itself or the canvas, not handles
-        if (e.target === leftHandle || e.target === rightHandle ||
-            leftHandle.contains(e.target) || rightHandle.contains(e.target)) return;
-
+        if (leftHandle.contains(e.target) || rightHandle.contains(e.target)) return;
         const dragOffset = e.clientX - container.getBoundingClientRect().left;
         const ghostWidth = parseFloat(container.style.width);
 
-        timeline.splice(timeline.indexOf(placed), 1);
-        container.remove();
-
-        startClipDrag(e, placed.clip, ghostWidth, dragOffset, (snappedTime) => {
-            if (snappedTime !== null) {
-                placed.startTime = snappedTime;
-                timeline.push(placed);
-                renderTimelineClip(placed);
-            }
-        });
+        if (e.shiftKey || shiftDown) {
+            // Duplicate: leave original, drag a copy
+            const copy = { ...placed, clip: { ...placed.clip }, reversed: placed.reversed };
+            startClipDrag(e, copy.clip, ghostWidth, dragOffset, (snappedTime) => {
+                if (snappedTime !== null) {
+                    copy.startTime = snappedTime;
+                    timeline.push(copy);
+                    renderTimelineClip(copy);
+                }
+            });
+        } else {
+            // Move: remove original, re-place on drop
+            timeline.splice(timeline.indexOf(placed), 1);
+            container.remove();
+            startClipDrag(e, placed.clip, ghostWidth, dragOffset, (snappedTime) => {
+                if (snappedTime !== null) {
+                    placed.startTime = snappedTime;
+                    timeline.push(placed);
+                    renderTimelineClip(placed);
+                }
+            });
+        }
     });
 
-    // ── Left TRIM (top half) ──────────────────────────────────────────────────
-    // Moves the start point into the source sample. Right edge stays fixed.
-    // Waveform scrolls to reveal the trimmed region.
+    // ── Left trim ─────────────────────────────────────────────────────────────
     leftTrim.addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-
+        e.stopPropagation(); e.preventDefault();
         handleDragActive = true;
-
-        const timelineRect = timelineEl.getBoundingClientRect();
-        const rightEdgePx = parseFloat(container.style.left) + parseFloat(container.style.width);
-
-        // The source clip's end point never changes during a left trim
+        const tlRect = timelineEl.getBoundingClientRect();
+        const rightEdge = parseFloat(container.style.left) + parseFloat(container.style.width);
         const srcEnd = placed.clip.startTime + placed.clip.duration;
-        // The earliest we can trim back to is the beginning of the source buffer
-        const minSrcStart = 0;
 
         function onMouseMove(e) {
-            const cursorPx = e.clientX - timelineRect.left;
-            const newLeft = Math.max(0, Math.min(cursorPx, rightEdgePx - HANDLE_WIDTH * 2));
-            const newWidth = rightEdgePx - newLeft;
+            const newLeft = Math.max(0, Math.min(e.clientX - tlRect.left, rightEdge - CLIP_HANDLE_WIDTH * 2));
+            const newWidth = rightEdge - newLeft;
+            const newDur = (newWidth / PX_PER_SEC) / (placed.stretchRatio ?? 1);
 
-            // Convert the new timeline width back to source duration (removing stretch)
-            const newDuration = (newWidth / PX_PER_SEC) / (placed.stretchRatio ?? 1);
-            // The new start is the end minus the new duration
-            const newSrcStart = Math.max(minSrcStart, srcEnd - newDuration);
-            const clampedDuration = srcEnd - newSrcStart;
+            let newStart, clampDur;
+            if (placed.reversed) {
+                // Source start is fixed; we trim from the source end
+                newStart = placed.clip.startTime;
+                clampDur = Math.min(newDur, sourceBuffer.duration - newStart);
+            } else {
+                // Source end is fixed; we trim from the source start
+                newStart = Math.max(0, srcEnd - newDur);
+                clampDur = srcEnd - newStart;
+            }
 
-            // sampleOffset = how many samples into the full source buffer the new start is
-            const sampleOffset = Math.floor(newSrcStart * buffer.sampleRate);
-            // Build a preview clip spanning from 0 to srcEnd so sampleOffset pans correctly
-            const visibleSampleCount = Math.round(clampedDuration * buffer.sampleRate);
-            const previewClip = { samples };
+            const offset = Math.floor(newStart * sourceBuffer.sampleRate);
+            const visible = Math.round(clampDur * sourceBuffer.sampleRate);
 
             container.style.left = newLeft + 'px';
             container.style.width = newWidth + 'px';
             canvas.width = Math.max(1, Math.round(newWidth));
-            drawClipCanvas(canvas, previewClip, sampleOffset, visibleSampleCount);
-            showLabel(container, `${clampedDuration.toFixed(2)}s`, 'amber');
-            container._pendingTrim = { newSrcStart, newDuration: clampedDuration, newLeft, newWidth };
+            if (placed.reversed) {
+                const currentSrcEnd = newStart + clampDur;
+                const srcEndSample = Math.floor(currentSrcEnd * sourceBuffer.sampleRate);
+                const srcStartSample = Math.floor(newStart * sourceBuffer.sampleRate);
+                const previewSamples = samples.slice(srcStartSample, srcEndSample).reverse();
+                drawClipCanvas(canvas, { samples: previewSamples });
+            } else {
+                drawClipCanvas(canvas, { samples }, offset, visible);
+            }
+            showLabel(container, `${clampDur.toFixed(2)}s`, 'teal');
+            container._pendingTrim = { newStart, clampDur, newLeft, newWidth };
         }
 
         function onMouseUp() {
-            handleDragActive = false;
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
+            handleDragActive = false;
             if (container._pendingTrim) {
-                const { newSrcStart, newDuration, newLeft, newWidth } = container._pendingTrim;
-                placed.clip = makeClipFromSource(newSrcStart, newDuration);
+                const { newStart, clampDur, newLeft, newWidth } = container._pendingTrim;
+                placed.clip = makeClipFromSource(newStart, clampDur);
+                // Re-apply reverse if needed
+                if (placed.reversed) placed.clip = { ...placed.clip, samples: placed.clip.samples.slice().reverse() };
                 placed.startTime = newLeft / PX_PER_SEC;
                 canvas.width = Math.max(1, Math.round(newWidth));
                 drawClipCanvas(canvas, placed.clip);
@@ -457,34 +728,28 @@ function renderTimelineClip(placed) {
         document.addEventListener('mouseup', onMouseUp);
     });
 
-    // ── Left STRETCH (bottom half) ────────────────────────────────────────────
-    // Moves left edge; right edge fixed. Changes stretchRatio.
+    // ── Left stretch ──────────────────────────────────────────────────────────
     leftStretch.addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-
+        e.stopPropagation(); e.preventDefault();
         handleDragActive = true;
-
-        const timelineRect = timelineEl.getBoundingClientRect();
-        const rightEdgePx = parseFloat(container.style.left) + parseFloat(container.style.width);
+        const tlRect = timelineEl.getBoundingClientRect();
+        const rightEdge = parseFloat(container.style.left) + parseFloat(container.style.width);
 
         function onMouseMove(e) {
-            const cursorPx = e.clientX - timelineRect.left;
-            const newLeft = Math.max(0, Math.min(cursorPx, rightEdgePx - HANDLE_WIDTH * 2));
-            const newWidth = rightEdgePx - newLeft;
+            const newLeft = Math.max(0, Math.min(e.clientX - tlRect.left, rightEdge - CLIP_HANDLE_WIDTH * 2));
+            const newWidth = rightEdge - newLeft;
             const newRatio = (newWidth / PX_PER_SEC) / placed.clip.duration;
-
             container.style.left = newLeft + 'px';
             container.style.width = newWidth + 'px';
             canvas.width = Math.max(1, Math.round(newWidth));
             drawClipCanvas(canvas, placed.clip);
-            showLabel(container, `${newRatio.toFixed(2)}×`, 'teal');
+            showLabel(container, `${newRatio.toFixed(2)}×`, 'amber');
         }
 
         function onMouseUp() {
-            handleDragActive = false;
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
+            handleDragActive = false;
             placed.startTime = parseFloat(container.style.left) / PX_PER_SEC;
             placed.stretchRatio = (parseFloat(container.style.width) / PX_PER_SEC) / placed.clip.duration;
             clearLabel(container);
@@ -494,87 +759,71 @@ function renderTimelineClip(placed) {
         document.addEventListener('mouseup', onMouseUp);
     });
 
-    // ── Right TRIM (top half) ─────────────────────────────────────────────────
-    // Moves right edge. Left edge fixed. Trims the end of the clip.
-    // Capped at original source end — can't extend beyond source material.
+    // ── Right trim ────────────────────────────────────────────────────────────
     rightTrim.addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-
+        e.stopPropagation(); e.preventDefault();
         handleDragActive = true;
-
-        const timelineRect = timelineEl.getBoundingClientRect();
-        const leftEdgePx = parseFloat(container.style.left);
+        const tlRect = timelineEl.getBoundingClientRect();
+        const leftEdge = parseFloat(container.style.left);
         const srcStart = placed.clip.startTime;
-        const maxDuration = buffer.duration - srcStart; // source boundary
+        const srcEnd = srcStart + placed.clip.duration;
+        const maxDur = sourceBuffer.duration - srcStart;
 
         function onMouseMove(e) {
-            const cursorPx = e.clientX - timelineRect.left;
-            const rawWidth = Math.max(HANDLE_WIDTH * 2, cursorPx - leftEdgePx);
-
-            // Convert pixel width → source duration (un-stretch), capped at source end
-            const newDuration = Math.min(
-                (rawWidth / PX_PER_SEC) / (placed.stretchRatio ?? 1),
-                maxDuration
-            );
-            const cappedWidth = Math.round(newDuration * (placed.stretchRatio ?? 1) * PX_PER_SEC);
-
-            container.style.width = cappedWidth + 'px';
-            canvas.width = Math.max(1, cappedWidth);
-            const previewClip = makeClipFromSource(srcStart, newDuration);
+            const rawWidth = Math.max(CLIP_HANDLE_WIDTH * 2, e.clientX - tlRect.left - leftEdge);
+            const newDur = Math.min((rawWidth / PX_PER_SEC) / (placed.stretchRatio ?? 1), maxDur);
+            const effectiveSrcStart = placed.reversed ? srcEnd - newDur : srcStart; const capWidth = Math.round(newDur * (placed.stretchRatio ?? 1) * PX_PER_SEC);
+            container.style.width = capWidth + 'px';
+            canvas.width = Math.max(1, capWidth);
+            const previewClip = makeClipFromSource(effectiveSrcStart, newDur);
+            if (placed.reversed) previewClip.samples = previewClip.samples.slice().reverse();
             drawClipCanvas(canvas, previewClip);
-            showLabel(container, `${newDuration.toFixed(2)}s`, 'amber');
-
-            container._pendingRightTrim = { newDuration, cappedWidth };
+            showLabel(container, `${newDur.toFixed(2)}s`, 'teal');
+            container._pendingRightTrim = { newDur };
         }
 
         function onMouseUp() {
-            handleDragActive = false;
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
-
+            handleDragActive = false;
             if (container._pendingRightTrim) {
-                const { newDuration } = container._pendingRightTrim;
-                placed.clip = makeClipFromSource(srcStart, newDuration);
+                const finalSrcStart = placed.reversed ? srcEnd - container._pendingRightTrim.newDur : srcStart;
+                placed.clip = makeClipFromSource(finalSrcStart, container._pendingRightTrim.newDur);
+                // Re-apply reverse if needed
+                if (placed.reversed) placed.clip = { ...placed.clip, samples: placed.clip.samples.slice().reverse() };
                 drawClipCanvas(canvas, placed.clip);
                 delete container._pendingRightTrim;
-                clearLabel(container);
             }
+            clearLabel(container);
         }
 
         document.addEventListener('mousemove', onMouseMove);
         document.addEventListener('mouseup', onMouseUp);
     });
 
-    // ── Right STRETCH (bottom half) ───────────────────────────────────────────
-    // Moves right edge. Left edge fixed. Changes stretchRatio.
+    // ── Right stretch ─────────────────────────────────────────────────────────
     rightStretch.addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        e.preventDefault();
-
+        e.stopPropagation(); e.preventDefault();
         handleDragActive = true;
-
-        const timelineRect = timelineEl.getBoundingClientRect();
-        const leftEdgePx = parseFloat(container.style.left);
+        const tlRect = timelineEl.getBoundingClientRect();
+        const leftEdge = parseFloat(container.style.left);
 
         function onMouseMove(e) {
-            const cursorPx = e.clientX - timelineRect.left;
-            const newWidth = Math.max(HANDLE_WIDTH * 2, Math.min(
-                cursorPx - leftEdgePx,
-                TIMELINE_DURATION * PX_PER_SEC - leftEdgePx
+            const newWidth = Math.max(CLIP_HANDLE_WIDTH * 2, Math.min(
+                e.clientX - tlRect.left - leftEdge,
+                TIMELINE_DURATION * PX_PER_SEC - leftEdge
             ));
             const newRatio = (newWidth / PX_PER_SEC) / placed.clip.duration;
-
             container.style.width = newWidth + 'px';
             canvas.width = Math.max(1, Math.round(newWidth));
             drawClipCanvas(canvas, placed.clip);
-            showLabel(container, `${newRatio.toFixed(2)}×`, 'teal');
+            showLabel(container, `${newRatio.toFixed(2)}×`, 'amber');
         }
 
         function onMouseUp() {
-            handleDragActive = false;
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
+            handleDragActive = false;
             placed.stretchRatio = (parseFloat(container.style.width) / PX_PER_SEC) / placed.clip.duration;
             clearLabel(container);
         }
@@ -589,92 +838,72 @@ function renderTimelineClip(placed) {
 function makeSplitHandle(side) {
     const outer = document.createElement('div');
     outer.style.cssText = `
-        position: absolute;
-        top: 0; ${side}: 0;
-        width: ${HANDLE_WIDTH}px;
-        height: 100%;
-        z-index: 10;
-        border-radius: ${side === 'left' ? '3px 0 0 3px' : '0 3px 3px 0'};
-        overflow: hidden;
-        opacity: 0;
-        transition: opacity 0.15s;
+        position:absolute;top:0;${side}:0;
+        width:${CLIP_HANDLE_WIDTH}px;height:100%;z-index:10;
+        border-radius:${side === 'left' ? '3px 0 0 3px' : '0 3px 3px 0'};
+        overflow:hidden;opacity:0;transition:opacity 0.15s;
     `;
 
-    // Top half = trim (amber)
+    // Top half = trim (teal)
     const trimHalf = document.createElement('div');
-    trimHalf.style.cssText = `
-        position: absolute; top: 0; left: 0;
-        width: 100%; height: 50%;
-        background: rgba(255, 180, 0, 0.85);
-        cursor: ${side === 'left' ? 'w-resize' : 'e-resize'};
-    `;
     trimHalf.title = side === 'left' ? 'Trim start' : 'Trim end';
-
-    // Bottom half = stretch (teal)
-    const stretchHalf = document.createElement('div');
-    stretchHalf.style.cssText = `
-        position: absolute; bottom: 0; left: 0;
-        width: 100%; height: 50%;
-        background: rgba(0, 255, 208, 0.75);
-        cursor: ew-resize;
+    trimHalf.style.cssText = `
+        position:absolute;top:0;left:0;width:100%;height:50%;
+        background:rgba(0,255,208,0.85);
+        cursor:${side === 'left' ? 'w-resize' : 'e-resize'};
     `;
+
+    // Bottom half = stretch (amber)
+    const stretchHalf = document.createElement('div');
     stretchHalf.title = 'Timestretch';
+    stretchHalf.style.cssText = `
+        position:absolute;bottom:0;left:0;width:100%;height:50%;
+        background:rgba(255,180,0,0.75);cursor:ew-resize;
+    `;
 
     outer.appendChild(trimHalf);
     outer.appendChild(stretchHalf);
-
     return { outer, trimHalf, stretchHalf };
 }
 
-// ─── Floating label (shown while dragging handles) ────────────────────────────
+// ─── Floating drag label ──────────────────────────────────────────────────────
 
 function showLabel(container, text, color = 'teal') {
     let label = container._dragLabel;
     if (!label) {
         label = document.createElement('div');
         label.style.cssText = `
-            position: absolute; top: -22px; left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0,0,0,0.85);
-            font-size: 11px; font-family: monospace;
-            padding: 2px 6px; border-radius: 3px;
-            white-space: nowrap; pointer-events: none;
-            z-index: 20;
+            position:absolute;top:-22px;left:50%;transform:translateX(-50%);
+            background:rgba(0,0,0,0.85);font-size:11px;font-family:monospace;
+            padding:2px 6px;border-radius:3px;white-space:nowrap;
+            pointer-events:none;z-index:20;border:1px solid;
         `;
         container.appendChild(label);
         container._dragLabel = label;
     }
     label.style.color = color === 'teal' ? '#00ffd0' : '#ffb400';
     label.style.borderColor = color === 'teal' ? 'rgba(0,255,208,0.3)' : 'rgba(255,180,0,0.3)';
-    label.style.border = '1px solid';
     label.textContent = text;
 }
 
 function clearLabel(container) {
-    if (container._dragLabel) {
-        container._dragLabel.remove();
-        container._dragLabel = null;
-    }
+    if (container._dragLabel) { container._dragLabel.remove(); container._dragLabel = null; }
 }
 
 // ─── Snap ─────────────────────────────────────────────────────────────────────
 
 function snapToFreePosition(rawTime, duration) {
     let time = Math.max(0, Math.min(rawTime, TIMELINE_DURATION - duration));
-
     for (const placed of timeline) {
-        const stretchedDuration = placed.clip.duration * (placed.stretchRatio ?? 1);
-        const overlapEnd = placed.startTime + stretchedDuration;
-
-        if (time < overlapEnd && time + duration > placed.startTime) {
-            const snapAfter = overlapEnd;
-            const snapBefore = placed.startTime - duration;
-            time = Math.abs(snapAfter - rawTime) < Math.abs(snapBefore - rawTime)
-                ? snapAfter
-                : Math.max(0, snapBefore);
+        const sd = placed.clip.duration * (placed.stretchRatio ?? 1);
+        const end = placed.startTime + sd;
+        if (time < end && time + duration > placed.startTime) {
+            const after = end;
+            const before = placed.startTime - duration;
+            time = Math.abs(after - rawTime) < Math.abs(before - rawTime)
+                ? after : Math.max(0, before);
         }
     }
-
     return time;
 }
 
@@ -683,114 +912,9 @@ function snapToFreePosition(rawTime, duration) {
 function makePlaceholder() {
     const el = document.createElement('div');
     el.style.cssText = `
-        position: absolute; height: 60px;
-        background: rgba(0,255,208,0.2);
-        border: 1px solid #00ffd0;
-        display: none;
+        position:absolute;height:60px;
+        background:rgba(0,255,208,0.2);border:1px solid #00ffd0;display:none;
     `;
     timelineEl.appendChild(el);
     return el;
 }
-
-// ─── p5 sketch (waveform viewer + selection) ──────────────────────────────────
-
-new p5(function (p) {
-
-    p.setup = function () {
-        p.createCanvas(700, 300).parent('canvas-container');
-    };
-
-    p.draw = function () {
-        const hasSelection = selection.startTime === null || selection.startTime === selection.endTime;
-        document.getElementById('save-btn').disabled = hasSelection;
-        document.getElementById('preview-btn').disabled = hasSelection;
-
-        drawWaveform();
-        drawSelection();
-        drawMouseCursor();
-        drawMainPlayhead();
-        drawTimelinePlayhead();
-    };
-
-    p.mousePressed = function () {
-        if (outOfBounds()) return;
-        selection.startTime = p.map(p.mouseX, 0, p.width, 0, buffer.duration);
-        selection.endTime = selection.startTime;
-        isDragging = true;
-    };
-
-    p.mouseDragged = function () {
-        if (!isDragging) return;
-        selection.endTime = p.map(p.constrain(p.mouseX, 0, p.width), 0, p.width, 0, buffer.duration);
-    };
-
-    p.mouseReleased = function () {
-        isDragging = false;
-        if (selection.startTime !== null && selection.startTime === selection.endTime && !outOfBounds()) {
-            playSelection(selection.startTime);
-            selection.startTime = null;
-            selection.endTime = null;
-        }
-    };
-
-    function outOfBounds() {
-        return p.mouseX < 0 || p.mouseX > p.width || p.mouseY < 0 || p.mouseY > p.height;
-    }
-
-    function drawWaveform() {
-        p.background(10, 10, 15);
-        const samplesPerPixel = samples.length / p.width;
-        p.stroke(0, 255, 208);
-        p.strokeWeight(1);
-        for (let px = 0; px < p.width; px++) {
-            const start = Math.floor(px * samplesPerPixel);
-            const end = Math.floor((px + 1) * samplesPerPixel);
-            let min = 1, max = -1;
-            for (let i = start; i < end; i++) {
-                if (samples[i] < min) min = samples[i];
-                if (samples[i] > max) max = samples[i];
-            }
-            const yMin = p.map(min, -1, 1, p.height * 0.9, p.height * 0.1);
-            const yMax = p.map(max, -1, 1, p.height * 0.9, p.height * 0.1);
-            p.line(px, yMax, px, yMin);
-        }
-    }
-
-    function drawSelection() {
-        if (selection.startTime === null || selection.startTime === selection.endTime) return;
-        const x1 = p.map(Math.min(selection.startTime, selection.endTime), 0, buffer.duration, 0, p.width);
-        const x2 = p.map(Math.max(selection.startTime, selection.endTime), 0, buffer.duration, 0, p.width);
-        p.noStroke();
-        p.fill(0, 255, 208, 40);
-        p.rect(x1, 0, x2 - x1, p.height);
-    }
-
-    function drawMouseCursor() {
-        if (outOfBounds()) return;
-        p.stroke(255, 255, 255, 180);
-        p.strokeWeight(1);
-        p.line(p.mouseX, 0, p.mouseX, p.height);
-    }
-
-    function drawMainPlayhead() {
-        if (player.state === 'stopped') return;
-        const elapsed = Tone.now() - mainPlayheadStart;
-        const x = p.map(Math.min(elapsed / buffer.duration, 1), 0, 1, 0, p.width);
-        p.stroke(255, 255, 255, 100);
-        p.strokeWeight(1);
-        p.line(x, 0, x, p.height);
-    }
-
-    function drawTimelinePlayhead() {
-        timelineCtx.clearRect(0, 0, timelineCanvas.width, timelineCanvas.height);
-        if (Tone.Transport.state !== 'started') return;
-        const x = Tone.Transport.seconds * PX_PER_SEC;
-        timelineCtx.strokeStyle = 'rgba(255,255,255,0.7)';
-        timelineCtx.lineWidth = 1;
-        timelineCtx.beginPath();
-        timelineCtx.moveTo(x, 0);
-        timelineCtx.lineTo(x, timelineCanvas.height);
-        timelineCtx.stroke();
-    }
-
-});
