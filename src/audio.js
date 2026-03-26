@@ -14,7 +14,10 @@ let soundTouchRegistered = false;
 export async function ensureReady() {
     if (audioCtx.state === 'suspended') await audioCtx.resume();
     if (!soundTouchRegistered) {
-        await SoundTouchNode.register(audioCtx, '/soundtouch-processor.js');
+        await SoundTouchNode.register(
+            audioCtx,
+            `${import.meta.env.BASE_URL}soundtouch-processor.js`
+        );
         soundTouchRegistered = true;
     }
 }
@@ -110,7 +113,7 @@ export async function startTimeline() {
     setTransportStart(audioCtx.currentTime);
 
     for (const placed of timeline) {
-        const when  = audioCtx.currentTime + placed.startTime;
+        const when = audioCtx.currentTime + placed.startTime;
         const ratio = placed.stretchRatio ?? 1;
         Math.abs(ratio - 1) < 0.01
             ? playDirect(placed.clip, when)
