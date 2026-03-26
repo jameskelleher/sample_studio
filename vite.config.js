@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
     root: '.',
-    base: '/jameskelleher/',
+    base: '/samplez_studio/',
     build: {
         rollupOptions: {
             input: './index.html',
